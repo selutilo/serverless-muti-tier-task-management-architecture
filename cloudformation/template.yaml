@@ -1,0 +1,658 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Serverless multi-tier task management app (S3+CloudFront, API Gateway+Lambda, DynamoDB, SNS, WAF)
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: taskflow
+    AllowedPattern: '^[a-z0-9-]+$'
+    Description: Lowercase project slug used in resource names.
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+  ApiStageName:
+    Type: String
+    Default: v1
+    AllowedPattern: '^[a-zA-Z0-9_-]+$'
+
+  FrontendBucketName:
+    Type: String
+    Description: Globally unique bucket name for static frontend assets.
+
+  UploadsBucketName:
+    Type: String
+    Description: Globally unique bucket name for user image uploads.
+
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: Optional email for SNS notifications. Leave blank to disable subscription.
+
+  PresignedUrlExpirySeconds:
+    Type: Number
+    Default: 900
+    MinValue: 60
+    MaxValue: 3600
+
+  EnableWAF:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'true'
+    Description: Enable AWS WAF on CloudFront (recommended for prod).
+
+Conditions:
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, '']]
+  UseWAF: !Equals [!Ref EnableWAF, 'true']
+
+Resources:
+  TasksTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-tasks'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: taskId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: taskId
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref FrontendBucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  UploadsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref UploadsBucketName
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods: [GET, PUT, HEAD]
+            AllowedOrigins: ['*']
+            AllowedHeaders: ['*']
+            MaxAge: 3000
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldUploads
+            Status: Enabled
+            ExpirationInDays: 90
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  AppSnsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-${Environment}-task-events'
+
+  AppSnsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasNotificationEmail
+    Properties:
+      TopicArn: !Ref AppSnsTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AppDataPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Scan
+                Resource: !GetAtt TasksTable.Arn
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub '${UploadsBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref AppSnsTopic
+
+  TasksCrudFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-tasks-crud'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 15
+      MemorySize: 256
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TasksTable
+          SNS_TOPIC_ARN: !Ref AppSnsTopic
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import uuid
+          from datetime import datetime
+          import boto3
+
+          dynamodb = boto3.resource("dynamodb")
+          table = dynamodb.Table(os.environ["TABLE_NAME"])
+          sns = boto3.client("sns")
+
+          def _resp(code, body):
+              return {
+                  "statusCode": code,
+                  "headers": {
+                      "Content-Type": "application/json",
+                      "Access-Control-Allow-Origin": "*",
+                      "Access-Control-Allow-Headers": "*",
+                      "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,OPTIONS",
+                  },
+                  "body": json.dumps(body),
+              }
+
+          def _notify(event_type, task_id):
+              sns.publish(
+                  TopicArn=os.environ["SNS_TOPIC_ARN"],
+                  Subject=f"Task event: {event_type}",
+                  Message=json.dumps({
+                      "eventType": event_type,
+                      "taskId": task_id,
+                      "timestampUtc": datetime.utcnow().isoformat() + "Z",
+                  })
+              )
+
+          def handler(event, context):
+              method = event.get("httpMethod", "GET")
+              path_params = event.get("pathParameters") or {}
+              task_id = path_params.get("id")
+
+              if method == "OPTIONS":
+                  return _resp(200, {"ok": True})
+
+              if method == "POST" and not task_id:
+                  body = json.loads(event.get("body") or "{}")
+                  new_id = str(uuid.uuid4())
+                  item = {
+                      "taskId": new_id,
+                      "title": body.get("title", ""),
+                      "description": body.get("description", ""),
+                      "imageKey": body.get("imageKey", ""),
+                      "status": body.get("status", "OPEN"),
+                      "createdAtUtc": datetime.utcnow().isoformat() + "Z",
+                      "updatedAtUtc": datetime.utcnow().isoformat() + "Z",
+                  }
+                  table.put_item(Item=item)
+                  _notify("CREATED", new_id)
+                  return _resp(201, item)
+
+              if method == "GET" and not task_id:
+                  items = table.scan().get("Items", [])
+                  return _resp(200, {"items": items})
+
+              if method == "GET" and task_id:
+                  item = table.get_item(Key={"taskId": task_id}).get("Item")
+                  if not item:
+                      return _resp(404, {"message": "Task not found"})
+                  return _resp(200, item)
+
+              if method == "PUT" and task_id:
+                  body = json.loads(event.get("body") or "{}")
+                  updates = {
+                      "title": body.get("title"),
+                      "description": body.get("description"),
+                      "status": body.get("status"),
+                      "imageKey": body.get("imageKey"),
+                      "updatedAtUtc": datetime.utcnow().isoformat() + "Z",
+                  }
+                  updates = {k: v for k, v in updates.items() if v is not None}
+                  if not updates:
+                      return _resp(400, {"message": "No fields to update"})
+
+                  expr = "SET " + ", ".join([f"#{k} = :{k}" for k in updates.keys()])
+                  ean = {f"#{k}": k for k in updates.keys()}
+                  eav = {f":{k}": v for k, v in updates.items()}
+
+                  result = table.update_item(
+                      Key={"taskId": task_id},
+                      UpdateExpression=expr,
+                      ExpressionAttributeNames=ean,
+                      ExpressionAttributeValues=eav,
+                      ReturnValues="ALL_NEW",
+                  )
+                  _notify("UPDATED", task_id)
+                  return _resp(200, result.get("Attributes", {}))
+
+              if method == "DELETE" and task_id:
+                  table.delete_item(Key={"taskId": task_id})
+                  _notify("DELETED", task_id)
+                  return _resp(200, {"deleted": task_id})
+
+              return _resp(405, {"message": "Method not allowed"})
+
+  PresignUploadFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-presign-upload'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 10
+      MemorySize: 256
+      Environment:
+        Variables:
+          UPLOADS_BUCKET: !Ref UploadsBucket
+          URL_EXPIRY_SECONDS: !Ref PresignedUrlExpirySeconds
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import uuid
+          import boto3
+
+          s3 = boto3.client("s3")
+
+          def _resp(code, body):
+              return {
+                  "statusCode": code,
+                  "headers": {
+                      "Content-Type": "application/json",
+                      "Access-Control-Allow-Origin": "*",
+                      "Access-Control-Allow-Headers": "*",
+                      "Access-Control-Allow-Methods": "GET,OPTIONS",
+                  },
+                  "body": json.dumps(body),
+              }
+
+          def handler(event, context):
+              method = event.get("httpMethod", "GET")
+              if method == "OPTIONS":
+                  return _resp(200, {"ok": True})
+              if method != "GET":
+                  return _resp(405, {"message": "Method not allowed"})
+
+              query = event.get("queryStringParameters") or {}
+              filename = query.get("filename", "image.jpg")
+              ext = filename.split(".")[-1] if "." in filename else "jpg"
+              key = f"uploads/{uuid.uuid4()}.{ext}"
+
+              url = s3.generate_presigned_url(
+                  "put_object",
+                  Params={
+                      "Bucket": os.environ["UPLOADS_BUCKET"],
+                      "Key": key,
+                      "ContentType": query.get("contentType", "image/jpeg"),
+                  },
+                  ExpiresIn=int(os.environ.get("URL_EXPIRY_SECONDS", "900")),
+              )
+
+              return _resp(200, {"uploadUrl": url, "imageKey": key})
+
+  RestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-api'
+      EndpointConfiguration:
+        Types: [REGIONAL]
+
+  ApiResourceTasks:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: tasks
+
+  ApiResourceTaskId:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !Ref ApiResourceTasks
+      PathPart: '{id}'
+
+  ApiResourcePresign:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: presign-upload
+
+  ApiMethodTasksAny:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref ApiResourceTasks
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${TasksCrudFunction.Arn}/invocations'
+
+  ApiMethodTaskIdAny:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref ApiResourceTaskId
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${TasksCrudFunction.Arn}/invocations'
+
+  ApiMethodPresignGet:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref ApiResourcePresign
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PresignUploadFunction.Arn}/invocations'
+
+  ApiMethodPresignOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref ApiResourcePresign
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'*'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  LambdaPermissionTasks:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref TasksCrudFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/*/*'
+
+  LambdaPermissionPresign:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref PresignUploadFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*/*/*'
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ApiMethodTasksAny
+      - ApiMethodTaskIdAny
+      - ApiMethodPresignGet
+      - ApiMethodPresignOptions
+    Properties:
+      RestApiId: !Ref RestApi
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      DeploymentId: !Ref ApiDeployment
+      RestApiId: !Ref RestApi
+      StageName: !Ref ApiStageName
+      TracingEnabled: true
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          MetricsEnabled: true
+          LoggingLevel: INFO
+
+  CloudFrontOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${ProjectName}-${Environment}-oac'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  StaticCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub '${ProjectName}-${Environment}-static-cache'
+        DefaultTTL: 86400
+        MaxTTL: 31536000
+        MinTTL: 0
+        ParametersInCacheKeyAndForwardedToOrigin:
+          CookiesConfig:
+            CookieBehavior: none
+          EnableAcceptEncodingBrotli: true
+          EnableAcceptEncodingGzip: true
+          HeadersConfig:
+            HeaderBehavior: none
+          QueryStringsConfig:
+            QueryStringBehavior: none
+
+  ApiCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub '${ProjectName}-${Environment}-api-cache'
+        DefaultTTL: 0
+        MaxTTL: 1
+        MinTTL: 0
+        ParametersInCacheKeyAndForwardedToOrigin:
+          CookiesConfig:
+            CookieBehavior: all
+          EnableAcceptEncodingBrotli: true
+          EnableAcceptEncodingGzip: true
+          HeadersConfig:
+            HeaderBehavior: whitelist
+            Headers:
+              - Authorization
+              - Content-Type
+          QueryStringsConfig:
+            QueryStringBehavior: all
+
+  ApiOriginRequestPolicy:
+    Type: AWS::CloudFront::OriginRequestPolicy
+    Properties:
+      OriginRequestPolicyConfig:
+        Name: !Sub '${ProjectName}-${Environment}-api-origin-request'
+        CookiesConfig:
+          CookieBehavior: all
+        HeadersConfig:
+          HeaderBehavior: allViewer
+        QueryStringsConfig:
+          QueryStringBehavior: all
+
+  AppWebACL:
+    Type: AWS::WAFv2::WebACL
+    Condition: UseWAF
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-web-acl'
+      Scope: CLOUDFRONT
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        CloudWatchMetricsEnabled: true
+        SampledRequestsEnabled: true
+        MetricName: !Sub '${ProjectName}-${Environment}-web-acl'
+      Rules:
+        - Name: AWSManagedRulesCommonRuleSet
+          Priority: 0
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            SampledRequestsEnabled: true
+            MetricName: common-rule-set
+
+  AppDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub '${ProjectName}-${Environment} app distribution'
+        DefaultRootObject: index.html
+        PriceClass: PriceClass_100
+        WebACLId: !If [UseWAF, !GetAtt AppWebACL.Arn, !Ref AWS::NoValue]
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            S3OriginConfig: {}
+            OriginAccessControlId: !GetAtt CloudFrontOAC.Id
+          - Id: ApiOrigin
+            DomainName: !Sub '${RestApi}.execute-api.${AWS::Region}.amazonaws.com'
+            OriginPath: !Sub '/${ApiStageName}'
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachePolicyId: !Ref StaticCachePolicy
+        CacheBehaviors:
+          - PathPattern: 'api/*'
+            TargetOriginId: ApiOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachePolicyId: !Ref ApiCachePolicy
+            OriginRequestPolicyId: !Ref ApiOriginRequestPolicy
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontRead
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action:
+              - s3:GetObject
+            Resource: !Sub '${FrontendBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${AppDistribution}'
+
+  TasksCrudErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-tasks-crud-errors'
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref TasksCrudFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  PresignErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-presign-errors'
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref PresignUploadFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  CloudFrontUrl:
+    Description: Frontend entry URL
+    Value: !Sub 'https://${AppDistribution.DomainName}'
+
+  ApiInvokeUrl:
+    Description: API base URL behind API Gateway
+    Value: !Sub 'https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${ApiStageName}'
+
+  TasksTableName:
+    Value: !Ref TasksTable
+
+  SnsTopicArn:
+    Value: !Ref AppSnsTopic
