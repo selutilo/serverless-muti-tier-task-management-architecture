@@ -1,0 +1,32 @@
+# Serverless Multi-Tier Task Management App
+
+## What It Demonstrates
+- Event-driven architecture
+- Infrastructure as Code (CloudFormation)
+- Security best practices
+- Cost optimization patterns
+
+## AWS Services 
+- Frontend: `S3 + CloudFront`
+- Backend: `API Gateway + Lambda (Python 3.12)`
+- Database: `DynamoDB`
+- Notifications: `SNS (email subscription optional)`
+- Monitoring: `CloudWatch alarms`
+- Security: `IAM least privilege`, `WAF (optional)`
+
+## App Capabilities
+- Create / read / update / delete tasks
+- Generate pre-signed S3 upload URL for images
+- Publish task event notifications via SNS
+
+## Security Notes
+- Frontend bucket is private and only readable via CloudFront OAC.
+- Upload bucket blocks public access and is encrypted.
+- Lambda role only allows required actions for DynamoDB, S3 uploads, SNS publish, logs.
+- WAF can be enabled for CloudFront in higher environments.
+
+## Cost Notes
+- DynamoDB uses `PAY_PER_REQUEST`.
+- Lambda/API are serverless (pay-per-use).
+- CloudFront `PriceClass_100` keeps edge cost lower.
+- Upload bucket lifecycle policy expires old objects after 90 days.
