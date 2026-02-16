@@ -1,0 +1,10 @@
+  ### This template models: 
+
+  - S3 + CloudFront static frontend
+  - API Gateway + Lambda 
+  - DynamoDB task store
+  - S3 image upload flow via pre-signed URL Lambda
+  - SNS email notifications
+  - CloudWatch Lambda error alarms
+  - IAM least-privilege execution role
+  - Optional WAF on CloudFront 
