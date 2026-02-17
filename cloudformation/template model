@@ -7,4 +7,4 @@
   - SNS email notifications
   - CloudWatch Lambda error alarms
   - IAM least-privilege execution role
-  - Optional WAF on CloudFront 
+  - WAF on CloudFront 
